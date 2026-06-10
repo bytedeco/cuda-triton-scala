@@ -208,70 +208,47 @@ This repository demonstrates multiple ways to integrate native GPU-accelerated c
 - Zero-copy between native and JVM is possible but requires careful lifecycle management to avoid premature GC or use-after-free
 - Be explicit about tensor dtype, endianness, and shape conventions when encoding/decoding
 
-## Triton Integration Guide
+## Triton (triton-lang) Integration Guide
 
-This repository ships client examples and model templates to help you get started with Triton.
+This repository targets OpenAI's Triton (the CUDA DSL, https://github.com/triton-lang/triton). Note: this is *not* NVIDIA's Triton Inference Server. OpenAI's Triton is a CUDA DSL primarily used for writing high-performance GPU kernels. This project demonstrates a Scala-first workflow:
 
-### Triton Model Repository Layout
+- Author kernels using the Scala DSL / macros provided by this project (see `cuda.dsl.triton.jit`) or supply precompiled PTX/CUBIN kernels produced by your toolchain.
+- At runtime, use JavaCPP-CUDA (Driver API) from Scala to load the compiled kernel module, allocate device memory, copy inputs/outputs, and launch kernels.
 
-Triton expects a directory layout like:
+Why Scala-first?
 
-```
-models/
-└── my_model/
-    ├── 1/
-    │   └── model.plan        # or model.onnx, model.pt, etc.
-    └── config.pbtxt
-```
+- The codebase includes a Scala macro-based DSL (`cuda.dsl.dsl.TritonKernelMacro`) that can annotate Scala methods to be treated as Triton-style kernels. This enables expressing kernels in Scala source and compiling them to GPU code during your build or a separate native compilation step.
+- Using JavaCPP-CUDA for the runtime ensures the JVM process can directly control the CUDA Driver API without writing manual JNI wrappers.
 
-Place your model artifacts under a versioned subfolder (e.g., `1/`), and include a `config.pbtxt` describing inputs/outputs and optimization settings.
+High-level workflow (no Python required):
 
-### Example config.pbtxt (minimal)
+1. Write kernel logic using the Scala DSL annotation `@cuda.dsl.triton.jit` or maintain precompiled PTX/CUBIN artifacts in `src/main/resources/native/kernels/`.
+2. Build your Scala project; if you use a separate native compilation step, ensure produced PTX/CUBIN files are copied into resources or an accessible native directory.
+3. From Scala, use JavaCPP's CUDA Driver API to:
+   - Initialize CUDA (cuInit)
+   - Create CUDA context
+   - Load module (cuModuleLoad or cuModuleLoadData)
+   - Get function handle (cuModuleGetFunction)
+   - Allocate device memory and copy inputs (cuMemAlloc / cuMemcpyHtoD)
+   - Launch kernel (cuLaunchKernel) with appropriate grid/block and stream
+   - Copy outputs back (cuMemcpyDtoH)
 
-```
-name: "simple_model"
-platform: "onnxruntime_onnx"
-max_batch_size: 8
-input [
-  {
-    name: "input__0"
-    data_type: TYPE_FP32
-    dims: [ 3 ]
-  }
-]
-output [
-  {
-    name: "output__0"
-    data_type: TYPE_FP32
-    dims: [ 1 ]
-  }
-]
-```
+This README contains concrete Scala examples showing how to perform the Driver API calls (see `src/main/scala/examples`).
 
-Adjust `platform`, `dims`, and `data_type` to match your actual model.
+Supported artifact workflows
 
-### Running Triton (Docker)
+- Precompiled PTX/CUBIN: Good for production deployment, compile kernels once for target architectures and deploy with the JVM artifact.
+- On-device JIT (if your toolchain supports it): You can dynamically load PTX at runtime using cuModuleLoadData and launch kernels immediately.
 
-Use Docker for local testing:
+Resource locations
 
-```bash
-docker run --gpus all --rm -p8000:8000 -p8001:8001 -p8002:8002 \
-  -v $(pwd)/triton_models:/models nvcr.io/nvidia/tritonserver:24.05-py3 \
-  tritonserver --model-repository=/models
-```
+- Put compiled artifacts in `src/main/resources/native/kernels/` to package them with your JAR.
+- Or place them in an external `native/kernels/` directory and set `NATIVE_KERNEL_DIR` env var to point to that folder at runtime.
 
-If you don't have GPUs locally or want CPU-only testing, use a CPU-only Triton image or start Triton with CPU platforms.
+Security note
 
-### Sending Requests from Scala
+- Loading and running GPU kernels involves executing native code on the host GPU. Ensure compiled kernels come from trusted sources and validate input sizes before kernel launches to prevent out-of-bounds memory operations.
 
-This repo includes small helper methods to construct HTTP/gRPC requests. The essential steps are:
-
-1. Build input tensors matching `config.pbtxt` (dtype, shape)
-2. Serialize to the wire format (HTTP JSON for REST or binary for gRPC)
-3. Send request and wait for response
-4. Deserialize outputs and validate shapes/types
-
-See `src/main/scala/triton/TritonHttpClient.scala` and `TritonGrpcClient.scala` for usage examples.
 
 ## Model Packaging for Triton
 
@@ -438,55 +415,16 @@ lazy val root = (project in file("."))
 Notes:
 - Uncomment JavaCPP or other native-binding dependencies only if you plan to use those libraries and ensure platform classifiers are correct for your OS/CPU/GPU.
 
-## Appendix B — Extended Triton config examples
+## Appendix B — Notes on Triton (triton-lang) vs other serving systems
 
-### 1) ONNX model config with batching, dynamic shapes and instance groups
+This project focuses on OpenAI's Triton (triton-lang) CUDA DSL and a Scala-first runtime using JavaCPP-CUDA. If you are instead deploying models with a separate model server (for example NVIDIA Triton Inference Server), you will need a different model repository layout and `config.pbtxt` files specific to that server.
 
-```
-name: "resnet50_onnx"
-platform: "onnxruntime_onnx"
-max_batch_size: 32
-input [
-  {
-    name: "input__0"
-    data_type: TYPE_FP32
-    dims: [ 3, -1, -1 ]
-    reshape: { shape: [ 3, 224, 224 ] }
-  }
-]
-output [
-  {
-    name: "output__0"
-    data_type: TYPE_FP32
-    dims: [ 1000 ]
-  }
-]
-instance_group [
-  {
-    kind: KIND_GPU
-    count: 1
-  }
-]
-dynamic_batching {
-  preferred_batch_size: [ 4, 8, 16 ]
-  max_queue_delay_microseconds: 1000
-}
-```
+The examples in this repository are scoped to:
 
-### 2) TensorRT plan example with CPU fallback
+- Producing or consuming PTX/CUBIN artifacts (triton-lang or other toolchains)
+- Using JavaCPP-CUDA Driver API to load and launch kernels from Scala
 
-```
-name: "my_tensorrt_model"
-platform: "tensorrt_plan"
-max_batch_size: 16
-input [ { name: "input", data_type: TYPE_FP32, dims: [ 1, 3, 224, 224 ] } ]
-output [ { name: "output", data_type: TYPE_FP32, dims: [ 1000 ] } ]
-instance_group {
-  kind: KIND_GPU
-  count: 1
-}
-optimization { priority: PRIORITY_MAX }
-```
+If you require examples for server-based deployment (ONNX/TensorRT and model repositories), consult the corresponding server documentation; those topics are outside the main focus of this codebase.
 
 ## Appendix C — Long-form Troubleshooting Guide
 
@@ -524,31 +462,37 @@ This section provides step-by-step checks and commands to diagnose common errors
 - Collect both client-side and server-side traces. On Triton, enable metrics and tracing; on client, measure request time including serialization time.
 - For GPU-bound models, enable profiler (Nsight) to inspect kernel launch times and memory copies.
 
-## Appendix D — Long Example: End-to-end Local Run
+## Appendix D — Example: Load PTX/CUBIN and launch Triton DSL kernel from Scala
 
-The following step-by-step example shows running a small ONNX model via Triton and calling it from Scala.
+This example demonstrates the recommended Scala workflow for running OpenAI Triton (triton-lang) kernels from a JVM process using JavaCPP-CUDA Driver APIs. It assumes you have a compiled PTX or CUBIN kernel artifact available (packaged in `src/main/resources/native/kernels/` or an external folder set via `NATIVE_KERNEL_DIR`).
 
-1. Prepare a sample ONNX model (e.g., a small classification model). Place it under `triton_models/sample_model/1/model.onnx`.
-2. Create `triton_models/sample_model/config.pbtxt` similar to the earlier examples.
-3. Start Triton pointing to `triton_models`:
+Steps:
 
-```bash
-docker run --gpus all --rm -p8000:8000 -p8001:8001 -p8002:8002 \
-  -v $(pwd)/triton_models:/models nvcr.io/nvidia/tritonserver:24.05-py3 \
-  tritonserver --model-repository=/models
-```
+1. Ensure your kernel artifact (e.g., `add_kernel.ptx`) is available in `src/main/resources/native/kernels/` or `native/kernels/` in the project root.
 
-4. Run Scala client (HTTP example):
+2. Build the project so resources are packaged:
 
 ```bash
-sbt "runMain examples.TritonHttpClientExample"
+sbt clean compile
 ```
 
-5. Expected trace:
+3. Run the Scala launcher example which uses JavaCPP-CUDA to load the PTX and launch the kernel:
 
-- client prints request serialization time
-- Triton server logs indicate `Model ready` and then `Inference request received`
-- client prints parsed outputs
+```bash
+sbt "runMain examples.TritonKernelLauncherExample"
+```
+
+What the example does (high level):
+
+- Calls `cuInit(0)` and creates a CUDA context
+- Loads kernel module via `cuModuleLoadData` pointing at the PTX bytes loaded from resources
+- Allocates GPU buffers via `cuMemAlloc`
+- Copies input arrays to device memory using `cuMemcpyHtoD`
+- Launches the kernel with `cuLaunchKernel` and the chosen grid/block configuration
+- Copies output data back with `cuMemcpyDtoH` and prints results
+
+See `src/main/scala/examples/TritonKernelLauncherExample.scala` for the full example code. The example is intentionally small and checks for common errors (module load, kernel not found, launch failure) and prints brief diagnostics to help debug device/driver mismatches.
+
 
 ## Appendix E — Sample Benchmark Output (synthetic)
 
@@ -574,7 +518,7 @@ Note: these numbers are synthetic and for illustration only. Actual numbers depe
 
 ## Appendix F — Glossary
 
-- Triton: NVIDIA Triton Inference Server (model serving)
+- Triton: In this repository, "Triton" refers to OpenAI's Triton (triton-lang), a CUDA DSL for writing GPU kernels. This is different from NVIDIA's Triton Inference Server.
 - JavaCPP: A Java library that generates JNI bindings to native C/C++ code
 - JNI: Java Native Interface
 - ONNX: Open Neural Network Exchange format

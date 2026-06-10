@@ -27,9 +27,9 @@
 
 ## 简介
 
-`cuda-triton-scala` 是一个用于演示 Scala 应用如何与本地 GPU 加速代码（CUDA）进行互操作，并如何使用 NVIDIA Triton Inference Server 进行模型部署和推理的示例仓库。项目以可复现的小规模示例为主，便于在本地与 CI 环境中验证集成方案。
+`cuda-triton-scala` 是一个演示如何在 Scala 生态中与 GPU 本地内核互操作的示例仓库，重点展示通过 JavaCPP-CUDA 驱动 API 从 JVM 加载并启动由 Triton DSL（triton-lang）风格或其它工具链生成的 PTX/CUBIN 内核的流程。
 
-仓库包含：本地 native 调用示例（JavaCPP/JNI）、Triton 客户端示例（HTTP/gRPC）、Triton 模型仓库模板以及诊断/调试建议。
+仓库包含：Scala 层的 Triton 风格 DSL（注解/宏）、本地 native 调用示例（JavaCPP/JNI）、以及在 JVM 中加载与执行预编译 GPU 内核的完整示例与诊断指南。
 
 ## 目标与范围
 
@@ -46,9 +46,9 @@
 ## 主要特性
 
 - Scala 3 友好的项目结构与 sbt 构建
-- JavaCPP / JNI 原生调用示例（包含加载与错误处理示例）
-- Triton HTTP/gRPC 客户端示例（Scala 实现）
-- Triton 模型仓库配置模板（`config.pbtxt` 示例）
+ - JavaCPP / JNI 原生调用示例（包含加载与错误处理示例）
+ - Scala-first 的 Triton DSL 支持（注解/宏）和如何把内核编译为 PTX/CUBIN 并在 JVM 中加载
+ - JavaCPP-CUDA Driver API 的运行时示例（加载模块、分配内存、拷贝、启动 kernel）
 - 性能基准脚本、部署建议与故障排查指南
 
 ## 依赖与要求
@@ -178,23 +178,26 @@ optimization { priority: PRIORITY_MAX }
 
 - 在客户端与服务器两侧收集时间戳；在 GPU 上使用 Nsight 进行内核级采样
 
-## 附录 D — 端到端本地运行示例（详细步骤）
+## 附录 D — 示例：在 Scala 中加载 PTX/CUBIN 并启动 Triton 风格内核
 
-1. 将一个小的 ONNX 模型放到 `triton_models/sample_model/1/model.onnx`
-2. 在 `triton_models/sample_model/config.pbtxt` 写入配置
-3. 使用 Docker 启动 Triton 并挂载 `triton_models`
+本示例说明如何在 JVM 进程中使用 JavaCPP-CUDA 驱动 API 来加载预编译的 PTX 或 CUBIN，并启动内核（无需 Python）。
 
-```bash
-docker run --gpus all --rm -p8000:8000 -p8001:8001 -p8002:8002 \
-  -v $(pwd)/triton_models:/models nvcr.io/nvidia/tritonserver:24.05-py3 \
-  tritonserver --model-repository=/models
-```
+步骤：
 
-4. 运行 Scala 客户端示例：
+1. 将编译好的 PTX/CUBIN（例如 `add_kernel.ptx`）放置于 `src/main/resources/native/kernels/` 或项目根的 `native/kernels/`，也可以通过环境变量 `NATIVE_KERNEL_DIR` 指定外部路径；
+2. 编译项目以确保资源被打包：
 
 ```bash
-sbt "runMain examples.TritonHttpClientExample"
+sbt clean compile
 ```
+
+3. 运行 Scala 启动器示例：
+
+```bash
+sbt "runMain examples.TritonKernelLauncherExample"
+```
+
+该示例会加载资源并演示 Driver API 的推荐调用序列（`cuInit`、`cuModuleLoadData`、`cuModuleGetFunction`、`cuMemAlloc`、`cuMemcpyHtoD`、`cuLaunchKernel`、`cuMemcpyDtoH` 等）。
 
 ## 附录 E — 合成基准示例输出
 
@@ -273,21 +276,23 @@ sbt "runMain examples.SimpleCudaExample"
 
 常见错误：`UnsatisfiedLinkError`（找不到 native 库）、CUDA 驱动/设备不匹配等。参见故障排查。
 
-### 3) Triton HTTP 客户端示例
+### 3) 在 Scala 中加载并启动 Triton 风格内核（Driver API）
 
-确保 Triton 服务启动并加载了示例模型（模型仓库路径与模型名称需与示例一致）。
-
-```bash
-sbt "runMain examples.TritonHttpClientExample"
-```
-
-### 4) Triton gRPC 客户端示例
+运行我们在仓库中提供的启动器示例，该示例会检测并（在可用时）使用 JavaCPP-CUDA Driver API 加载内核并启动：
 
 ```bash
-sbt "runMain examples.TritonGrpcClientExample"
+sbt "runMain examples.TritonKernelLauncherExample"
 ```
 
-示例包含构建请求、序列化、发送并解析响应的完整流程，便于直接参考并集成到生产客户端中。
+### 4) JavaCPP-CUDA 示例
+
+演示如何检测 JavaCPP-CUDA 驱动类并展示调用片段（不会直接执行内核），用于快速检查运行时依赖：
+
+```bash
+sbt "runMain examples.JavaCppCudaExample"
+```
+
+示例文件位于 `src/main/scala/examples/`，可以直接参考或修改以适配你自己的内核与参数传递逻辑。
 
 ## 工程结构（建议）
 
@@ -393,26 +398,21 @@ output [
 
 根据模型实际输入输出调整 `platform`、`dims`、`data_type` 等字段。
 
-### 本地运行 Triton（Docker）
+（注意：本仓库面向 OpenAI 的 triton-lang（Triton CUDA DSL）和 Scala 驱动层示例；并不依赖 NVIDIA Triton Inference Server 的模型仓库与 HTTP/gRPC 接口。若你确实需要使用 Triton Server，请参考官方文档或其他专门的示例仓库。）
 
-```bash
-docker run --gpus all --rm -p8000:8000 -p8001:8001 -p8002:8002 \
-  -v $(pwd)/triton_models:/models nvcr.io/nvidia/tritonserver:24.05-py3 \
-  tritonserver --model-repository=/models
-```
-
-若无 GPU，可选择 CPU-only 的 Triton 镜像或在 Triton 启动参数中禁用 GPU 后端。
-
-### 从 Scala 发送推理请求
+### 从 Scala 加载并启动 PTX/CUBIN（Driver API）
 
 关键步骤：
 
-1. 构建输入 tensor，确保 shape 与 `config.pbtxt` 一致；
-2. 序列化为 Triton 支持的请求格式（HTTP JSON 或 gRPC 二进制）；
-3. 发送请求并等待响应；
-4. 解析输出并转换为 Scala 原生类型。
+1. 读取并加载 PTX/CUBIN 二进制（例如从 classpath 的 `native/kernels` 目录或外部 `NATIVE_KERNEL_DIR`）；
+2. 调用 CUDA Driver API（`cuInit`, `cuDeviceGet`, `cuCtxCreate`）；
+3. 使用 `cuModuleLoadData` / `cuModuleLoad` 加载内核模块；
+4. 使用 `cuModuleGetFunction` 获取内核函数句柄；
+5. 使用 `cuMemAlloc` 分配设备内存并用 `cuMemcpyHtoD` 传输输入；
+6. 使用 `cuLaunchKernel` 启动内核（传入 grid/block、参数指针与 stream）；
+7. 使用 `cuMemcpyDtoH` 将输出拷回主机，最后释放资源。
 
-本仓库中的 `triton` 包提供了简单的辅助方法实现以上流程。
+仓库中的 `examples/TritonKernelLauncherExample.scala` 给出一个完整的启动流程示例（基于 JavaCPP-CUDA 驱动 API）。
 
 ## 模型打包示例
 
